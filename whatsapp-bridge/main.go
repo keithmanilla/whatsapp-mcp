@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +30,13 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/proto"
+)
+
+// QR code state — exposed via /api/qr and /api/status HTTP endpoints
+var (
+	currentQRCode string
+	qrMutex       sync.RWMutex
+	isConnected   bool
 )
 
 // Message represents a chat message for our client
@@ -222,9 +230,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			return false, fmt.Sprintf("Error parsing JID: %v", err)
 		}
 	} else {
+		// Strip leading '+' from phone numbers
+		phone := strings.TrimPrefix(recipient, "+")
 		// Create JID from phone number
 		recipientJID = types.JID{
-			User:   recipient,
+			User:   phone,
 			Server: "s.whatsapp.net", // For personal chats
 		}
 	}
@@ -641,7 +651,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -774,6 +784,42 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
+	// Handler for QR code retrieval (used by orchestrator/Flutter)
+	http.HandleFunc("/api/qr", func(w http.ResponseWriter, r *http.Request) {
+		qrMutex.RLock()
+		defer qrMutex.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"qr":        currentQRCode,
+			"connected": isConnected,
+		})
+	})
+
+	// Handler for connection status check
+	http.HandleFunc("/api/status", func(w http.ResponseWriter, r *http.Request) {
+		qrMutex.RLock()
+		defer qrMutex.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"connected": isConnected,
+		})
+	})
+
+	// Handler for logout (unlink WhatsApp)
+	http.HandleFunc("/api/logout", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method not allowed", 405)
+			return
+		}
+		client.Logout(context.Background())
+		qrMutex.Lock()
+		currentQRCode = ""
+		isConnected = false
+		qrMutex.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+	})
+
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
@@ -800,14 +846,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -866,12 +912,20 @@ func main() {
 			return
 		}
 
-		// Print QR code for pairing with phone
+		// Print QR code for pairing with phone and store for HTTP API
 		for evt := range qrChan {
 			if evt.Event == "code" {
+				qrMutex.Lock()
+				currentQRCode = evt.Code
+				isConnected = false
+				qrMutex.Unlock()
 				fmt.Println("\nScan this QR code with your WhatsApp app:")
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else if evt.Event == "success" {
+				qrMutex.Lock()
+				currentQRCode = ""
+				isConnected = true
+				qrMutex.Unlock()
 				connected <- true
 				break
 			}
@@ -892,6 +946,9 @@ func main() {
 			logger.Errorf("Failed to connect: %v", err)
 			return
 		}
+		qrMutex.Lock()
+		isConnected = true
+		qrMutex.Unlock()
 		connected <- true
 	}
 
@@ -973,7 +1030,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1045,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {
