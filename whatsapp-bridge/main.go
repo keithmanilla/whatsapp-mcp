@@ -902,6 +902,9 @@ func main() {
 	// Create channel to track connection success
 	connected := make(chan bool, 1)
 
+	// Start REST API server BEFORE QR flow so Flutter can fetch QR via HTTP
+	startRESTServer(client, messageStore, 8080)
+
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
 		// No ID stored, this is a new client, need to pair with phone
@@ -961,9 +964,6 @@ func main() {
 	}
 
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
-
-	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)
